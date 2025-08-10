@@ -1,19 +1,18 @@
 require('dotenv').config();
-
 const { WebSocketServer, WebSocket } = require("ws")
 const { MongoClient } = require("mongodb")
-
-const roles = ["Batter", "Bowler", "All-Rounder", "Wicketkeeper-Batter", "Wicketkeeper"]
 const PORT = process.env.PORT || 8080
 const MONGODB_URI = process.env.MONGODB_URI;
+const roles = ["Batter", "Bowler", "All-Rounder", "Wicketkeeper-Batter", "Wicketkeeper"]
+
 const wss = new WebSocketServer({ port: PORT })
 const rooms = {}
 const roomData = {}
 let allPlayers = []
 let playersFetched = false
 
-const client = new MongoClient(MONGODB_URI)
-console.log("✅ Backend server starting...");
+const uri = MONGODB_URI
+const client = new MongoClient(uri)
 
 async function fetchPlayersFromMongo() {
   try {
@@ -27,7 +26,7 @@ async function fetchPlayersFromMongo() {
       const role = roles[i]
       const playersInRole = await collection.find({ Role: role }).sort({ "Matches in IPL": -1 }).toArray()
       allPlayers[i] = playersInRole
-      console.log(`Fetched ${playersInRole.length} players for role: ${role} (LIMITED FOR TESTING)`)
+      console.log(`Fetched ${playersInRole.length} players for role: ${role}`)
     }
 
     playersFetched = true
@@ -199,6 +198,8 @@ const removeClientFromRoom = (ws) => {
         roomData[ws.roomId].selectedTeams = roomData[ws.roomId].selectedTeams.filter(
           (team) => team.code !== ws.teamName,
         )
+        // Update waiting teams count when a team is removed
+        roomData[ws.roomId].waitingTeams = roomData[ws.roomId].selectedTeams.length
       }
     }
 
@@ -208,6 +209,8 @@ const removeClientFromRoom = (ws) => {
         room: ws.roomId,
         size: newSize,
         selectedTeams: roomData[ws.roomId]?.selectedTeams || [],
+        waitingTeams: roomData[ws.roomId]?.waitingTeams || 0,
+        minTeamsRequired: roomData[ws.roomId]?.minTeamsRequired || 10,
       })
     }
 
@@ -224,6 +227,9 @@ const broadcastToRoom = (roomId, message, excludeWs = null) => {
 
   const activeClients = rooms[roomId].filter((client) => client.readyState === WebSocket.OPEN)
 
+  // Clean up dead connections
+  rooms[roomId] = activeClients
+
   activeClients.forEach((client) => {
     try {
       if (client !== excludeWs && client.roomId === roomId) {
@@ -231,6 +237,8 @@ const broadcastToRoom = (roomId, message, excludeWs = null) => {
       }
     } catch (err) {
       console.error("Broadcast error:", err)
+      // Remove failed client from room
+      rooms[roomId] = rooms[roomId].filter(c => c !== client)
     }
   })
 }
@@ -526,8 +534,10 @@ wss.on("connection", (ws) => {
             )
           }
 
+          // Remove client from any existing room first
           removeClientFromRoom(ws)
 
+          // Initialize room if it doesn't exist
           if (!rooms[data.room]) {
             rooms[data.room] = []
             roomData[data.room] = {
@@ -564,64 +574,84 @@ wss.on("connection", (ws) => {
             console.log(`Created room ${data.room} with ${totalPlayers} total players available`)
           }
 
-          const existingConnection = rooms[data.room].find(
-            (client) => client.teamName === data.teamName && client.readyState === WebSocket.OPEN,
-          )
-
-          if (existingConnection) {
-            rooms[data.room] = rooms[data.room].filter((client) => client !== existingConnection)
-            roomData[data.room].selectedTeams = roomData[data.room].selectedTeams.filter(
-              (team) => team.code !== data.teamName,
-            )
-          }
-
-          rooms[data.room].push(ws)
-          ws.roomId = data.room
-          ws.teamName = data.teamName || null
-
+          // Handle team selection if teamName is provided
           if (data.teamName) {
-            const existingTeam = roomData[data.room].selectedTeams.find((t) => t.code === data.teamName)
-            if (!existingTeam) {
-              const teamInfo = initialTeams.find((t) => t.code === data.teamName) || {
-                name: data.teamName,
-                code: data.teamName,
-                color: "from-gray-500 to-gray-700",
-                logo: "🏏",
-              }
+            // Remove any existing connection with the same team name
+            const existingConnection = rooms[data.room].find(
+              (client) => client.teamName === data.teamName && client.readyState === WebSocket.OPEN,
+            )
 
+            if (existingConnection) {
+              console.log(`Removing existing connection for team ${data.teamName}`)
+              rooms[data.room] = rooms[data.room].filter((client) => client !== existingConnection)
+              roomData[data.room].selectedTeams = roomData[data.room].selectedTeams.filter(
+                (team) => team.code !== data.teamName,
+              )
+            }
+
+            // Check if this team is already selected by someone else
+            const teamAlreadySelected = roomData[data.room].selectedTeams.find((t) => t.code === data.teamName)
+            
+            if (teamAlreadySelected) {
+              return ws.send(
+                JSON.stringify({
+                  type: "error",
+                  message: `Team ${data.teamName} is already selected by another player`,
+                }),
+              )
+            }
+
+            // Add team to selected teams if not already there
+            const teamInfo = initialTeams.find((t) => t.code === data.teamName)
+            if (teamInfo) {
               roomData[data.room].selectedTeams.push({
                 ...teamInfo,
                 selectedAt: new Date().toISOString(),
                 selectedBy: data.teamName,
               })
-
+              
+              // Update waiting teams count
               roomData[data.room].waitingTeams = roomData[data.room].selectedTeams.length
-
-              if (
-                !roomData[data.room].auctionStarted &&
-                roomData[data.room].waitingTeams >= roomData[data.room].minTeamsRequired
-              ) {
-                roomData[data.room].auctionStarted = true
-                roomData[data.room].isActive = true
-                roomData[data.room].currentPlayer = roomData[data.room].players[0][0]
-                roomData[data.room].basePrice = roomData[data.room].currentPlayer["Base Price (Rs Lakh)"] / 100
-                roomData[data.room].auctionEnded = false
-
-                console.log(`🚀 Auction started in room ${data.room}! First player: ${roomData[data.room].currentPlayer["Player Name"]}`)
-
-                broadcastToRoom(data.room, {
-                  type: "auction_started",
-                  player: roomData[data.room].currentPlayer,
-                  currentBid: 0,
-                  timer: 30,
-                  basePrice: roomData[data.room].basePrice,
-                })
-              }
+              console.log(`Team ${data.teamName} selected. Waiting teams: ${roomData[data.room].waitingTeams}/${roomData[data.room].minTeamsRequired}`)
             }
           }
 
+          // Add client to room
+          rooms[data.room].push(ws)
+          ws.roomId = data.room
+          ws.teamName = data.teamName || null
+
           const roomSize = rooms[data.room].length
 
+          // Check if auction should start
+          if (
+            !roomData[data.room].auctionStarted &&
+            roomData[data.room].waitingTeams >= roomData[data.room].minTeamsRequired &&
+            roomData[data.room].players[0].length > 0
+          ) {
+            roomData[data.room].auctionStarted = true
+            roomData[data.room].isActive = true
+            roomData[data.room].currentPlayer = roomData[data.room].players[0][0]
+            roomData[data.room].basePrice = roomData[data.room].currentPlayer["Base Price (Rs Lakh)"] / 100
+            roomData[data.room].auctionEnded = false
+
+            console.log(`🚀 Auction started in room ${data.room}! First player: ${roomData[data.room].currentPlayer["Player Name"]}`)
+
+            // Broadcast auction start to all clients in room
+            broadcastToRoom(data.room, {
+              type: "auction_started",
+              player: roomData[data.room].currentPlayer,
+              currentBid: 0,
+              timer: 30,
+              basePrice: roomData[data.room].basePrice,
+              setInfo: {
+                index: 0,
+                role: roles[0],
+              },
+            })
+          }
+
+          // Send join confirmation to the client
           ws.send(
             JSON.stringify({
               type: "joined",
@@ -648,6 +678,7 @@ wss.on("connection", (ws) => {
             }),
           )
 
+          // Broadcast member joined to other clients
           broadcastToRoom(
             data.room,
             {
@@ -664,7 +695,7 @@ wss.on("connection", (ws) => {
           )
 
           console.log(
-            `Client joined ${data.room} as ${data.teamName} (${roomData[data.room].waitingTeams}/${roomData[data.room].minTeamsRequired} teams)`,
+            `Client joined ${data.room} as ${data.teamName || 'spectator'} (${roomData[data.room].waitingTeams}/${roomData[data.room].minTeamsRequired} teams)`,
           )
           break
 
@@ -679,8 +710,19 @@ wss.on("connection", (ws) => {
           }
 
           const { teamCode } = data
-          const teamIndex = roomData[ws.roomId].teams.findIndex((t) => t.code === teamCode)
+          
+          // Check if team is already selected
+          const alreadySelected = roomData[ws.roomId].selectedTeams.find((t) => t.code === teamCode)
+          if (alreadySelected) {
+            return ws.send(
+              JSON.stringify({
+                type: "error",
+                message: "Team already selected",
+              }),
+            )
+          }
 
+          const teamIndex = roomData[ws.roomId].teams.findIndex((t) => t.code === teamCode)
           if (teamIndex === -1) {
             return ws.send(
               JSON.stringify({
@@ -697,12 +739,20 @@ wss.on("connection", (ws) => {
             selectedBy: ws.teamName || "Unknown",
           })
 
+          // Update team name for this connection
+          ws.teamName = teamCode
+          
+          // Update waiting teams count
+          roomData[ws.roomId].waitingTeams = roomData[ws.roomId].selectedTeams.length
+
           broadcastToRoom(ws.roomId, {
             type: "team_selected",
             room: ws.roomId,
             team: selectedTeam,
             availableTeams: roomData[ws.roomId].teams,
             selectedTeams: roomData[ws.roomId].selectedTeams,
+            waitingTeams: roomData[ws.roomId].waitingTeams,
+            minTeamsRequired: roomData[ws.roomId].minTeamsRequired,
           })
 
           ws.send(
@@ -712,6 +762,8 @@ wss.on("connection", (ws) => {
               team: selectedTeam,
             }),
           )
+          
+          console.log(`Team ${teamCode} selected in room ${ws.roomId}. Waiting: ${roomData[ws.roomId].waitingTeams}/${roomData[ws.roomId].minTeamsRequired}`)
           break
 
         case "get_teams":
@@ -734,6 +786,9 @@ wss.on("connection", (ws) => {
               currentBid: roomData[data.room].currentBid,
               biddingHistory: roomData[data.room].biddingHistory,
               timer: roomData[data.room].timer,
+              waitingTeams: roomData[data.room].waitingTeams,
+              minTeamsRequired: roomData[data.room].minTeamsRequired,
+              auctionStarted: roomData[data.room].auctionStarted,
             }),
           )
           break
@@ -750,6 +805,16 @@ wss.on("connection", (ws) => {
 
           const { team, amount } = data
           const room = roomData[ws.roomId]
+
+          // Check if auction has started
+          if (!room.auctionStarted) {
+            return ws.send(
+              JSON.stringify({
+                type: "error",
+                message: "Auction has not started yet",
+              }),
+            )
+          }
 
           const validation = validateBid(ws.roomId, team, amount)
           if (!validation.valid) {
@@ -810,6 +875,8 @@ wss.on("connection", (ws) => {
               size: rooms[data.room].length,
               teams: roomData[data.room]?.teams || [],
               selectedTeams: roomData[data.room]?.selectedTeams || [],
+              waitingTeams: roomData[data.room]?.waitingTeams || 0,
+              minTeamsRequired: roomData[data.room]?.minTeamsRequired || 10,
             }),
           )
           break
@@ -870,6 +937,9 @@ setInterval(() => {
     const room = roomData[roomId]
     const activeClients = rooms[roomId]?.filter((client) => client.readyState === WebSocket.OPEN) || []
 
+    // Clean up dead connections
+    rooms[roomId] = activeClients
+
     // Skip if no active clients in room
     if (activeClients.length === 0) {
       return
@@ -882,7 +952,7 @@ setInterval(() => {
         type: "set_break_update",
         breakTime: room.setBreakTimer,
         room: roomId,
-        nextSet: roles[(room.currentSetIndex + 1) % roles.length],
+        nextSet: roles[room.currentSetIndex],
       })
 
       if (room.setBreakTimer <= 0) {
@@ -903,10 +973,11 @@ setInterval(() => {
         minTeams: room.minTeamsRequired || 10,
         selectedTeams: room.selectedTeams,
         room: roomId,
+        auctionStarted: false,
       })
 
       // Check if we now have enough teams to start
-      if (room.waitingTeams >= (room.minTeamsRequired || 10)) {
+      if (room.waitingTeams >= (room.minTeamsRequired || 10) && room.players[0].length > 0) {
         room.auctionStarted = true
         room.isActive = true
         room.currentPlayer = room.players[room.currentSetIndex][0]
@@ -930,7 +1001,7 @@ setInterval(() => {
     }
 
     // Normal auction timer logic
-    if (room.timer > 0 && !room.sold && activeClients.length > 0) {
+    if (room.timer > 0 && !room.sold && activeClients.length > 0 && room.isActive) {
       room.timer--
       broadcastToRoom(roomId, {
         type: "timer_update",
@@ -939,7 +1010,7 @@ setInterval(() => {
         currentBid: room.currentBid,
         highestBidder: room.highestBidder,
       })
-    } else if (room.timer === 0 && !room.sold) {
+    } else if (room.timer === 0 && !room.sold && room.isActive) {
       handlePlayerSold(roomId)
     }
   })
@@ -962,4 +1033,4 @@ wss.on("close", () => {
   console.log("Server shutting down")
 })
 
-console.log("WebSocket server running on port", PORT)
+console.log("WebSocket server running on ws://localhost:8080")
