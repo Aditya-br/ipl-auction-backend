@@ -2,7 +2,7 @@ require('dotenv').config();
 const { WebSocketServer, WebSocket } = require("ws")
 const { MongoClient } = require("mongodb")
 const PORT = process.env.PORT || 8080
-const MONGODB_URI = process.env.MONGODB_URI;
+const MONGODB_URI = process.env.MONGODB_URI
 const roles = ["Batter", "Bowler", "All-Rounder", "Wicketkeeper-Batter", "Wicketkeeper"]
 
 const wss = new WebSocketServer({ port: PORT })
@@ -11,7 +11,10 @@ const roomData = {}
 let allPlayers = []
 let playersFetched = false
 
-const uri = MONGODB_URI
+const uri = MONGODB_URI || "mongodb://127.0.0.1:27017"
+if (!MONGODB_URI) {
+  console.warn("MONGODB_URI is not set. Using default MongoDB URI: mongodb://127.0.0.1:27017")
+}
 const client = new MongoClient(uri)
 
 async function fetchPlayersFromMongo() {
@@ -604,6 +607,7 @@ wss.on("connection", (ws) => {
             // Add team to selected teams if not already there
             const teamInfo = initialTeams.find((t) => t.code === data.teamName)
             if (teamInfo) {
+              roomData[data.room].teams = roomData[data.room].teams.filter((team) => team.code !== data.teamName)
               roomData[data.room].selectedTeams.push({
                 ...teamInfo,
                 selectedAt: new Date().toISOString(),
