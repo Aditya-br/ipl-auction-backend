@@ -1,4 +1,8 @@
-require('dotenv').config();
+try {
+  require('dotenv').config();
+} catch (err) {
+  console.warn('dotenv is not installed; skipping environment loading.');
+}
 const { WebSocketServer, WebSocket } = require("ws")
 const { MongoClient } = require("mongodb")
 const PORT = process.env.PORT || 8080
